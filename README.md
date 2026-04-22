@@ -38,7 +38,21 @@ Each run saves two files into `-o <dir>`:
 - **Gemini logged in** in that Chrome — the CLI reuses your cookies via the real browser
 - **Go 1.22+** to build
 
-## Build
+## Install
+
+### Pre-built binary (recommended)
+
+```bash
+# macOS arm64 (Apple Silicon) — swap the suffix for your platform:
+curl -L -o nanobanana-cli \
+  https://github.com/autoclaw-cc/nanobanana-cli/releases/latest/download/nanobanana-cli-darwin-arm64
+chmod +x nanobanana-cli
+./nanobanana-cli --help
+```
+
+Available assets per release: `nanobanana-cli-{darwin,linux}-{arm64,amd64}`. See the [releases page](https://github.com/autoclaw-cc/nanobanana-cli/releases).
+
+### Build from source
 
 ```bash
 git clone https://github.com/autoclaw-cc/nanobanana-cli.git

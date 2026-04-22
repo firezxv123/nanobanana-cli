@@ -1,8 +1,8 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -12,16 +12,14 @@ import (
 	"nanobanana-cli/output"
 )
 
-func itoa(i int) string { return strconv.Itoa(i) }
-
 const sessionName = "nanobanana-cli"
 
 var rootCmd = &cobra.Command{
 	Use:   "nanobanana-cli",
 	Short: "Generate images via Google Gemini (Nano Banana) and save full + thumbnail",
 	Long: `nanobanana-cli drives your real Chrome session (via kimi-webbridge) to send a
-prompt to Gemini, waits for the Nano Banana image to appear, extracts it from
-the page via canvas, and saves a full-size PNG + a locally-scaled thumbnail.
+prompt to Gemini, intercepts the "Download full-size" response chain, and saves
+the real high-res PNG (currently 2816×1536) plus a locally-scaled thumbnail.
 
 Requires: Kimi Desktop App running, Chrome extension connected, Gemini logged in.`,
 }
@@ -45,7 +43,7 @@ func newGenCmd() *cobra.Command {
 		Short: "Generate an image from a prompt, save full + thumbnail",
 		Run: func(cmd *cobra.Command, args []string) {
 			if len(args) != 1 {
-				output.Error("invalid_args", "gen requires exactly one <prompt> argument (got "+itoa(len(args))+")")
+				output.Error("invalid_args", fmt.Sprintf("gen requires exactly one <prompt> argument (got %d)", len(args)))
 				os.Exit(1)
 			}
 			prompt := args[0]
