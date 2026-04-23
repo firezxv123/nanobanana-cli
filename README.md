@@ -8,6 +8,7 @@ The CLI drives your **real Chrome session** through [`kimi-webbridge`](https://w
 
 ```bash
 nanobanana-cli gen "画一朵粉色月季花，微距特写" -o ./out
+nanobanana-cli gen "参考这两张图做一个更现代的版本" -r ./ref1.png -r ./ref2.jpg -o ./out
 ```
 
 ```json
@@ -67,6 +68,7 @@ nanobanana-cli gen <prompt> [flags]
 
 Flags:
   -o, --out string        output directory (default ".")
+  -r, --ref stringArray   reference image path to paste into Gemini before sending the prompt (repeatable)
       --thumb-width int   thumbnail width in px (default 256)
       --timeout int       max seconds to wait for image generation (default 300)
 ```

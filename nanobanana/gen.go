@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,18 +22,20 @@ const geminiURL = "https://gemini.google.com/"
 
 // Result is the JSON payload returned by `gen`.
 type Result struct {
-	Prompt     string `json:"prompt"`
-	Full       string `json:"full"`
-	Thumb      string `json:"thumb"`
-	Width      int    `json:"width"`
-	Height     int    `json:"height"`
-	ThumbWidth int    `json:"thumb_width"`
-	ElapsedMS  int64  `json:"elapsed_ms"`
+	Prompt     string   `json:"prompt"`
+	Refs       []string `json:"refs,omitempty"`
+	Full       string   `json:"full"`
+	Thumb      string   `json:"thumb"`
+	Width      int      `json:"width"`
+	Height     int      `json:"height"`
+	ThumbWidth int      `json:"thumb_width"`
+	ElapsedMS  int64    `json:"elapsed_ms"`
 }
 
 // Options drive a single image generation.
 type Options struct {
 	Prompt     string
+	Refs       []string
 	OutDir     string
 	ThumbWidth int
 	Timeout    time.Duration
@@ -71,6 +74,10 @@ func Gen(c *browser.Client, opts Options) (*Result, error) {
 		return nil, fmt.Errorf("navigate: %w", err)
 	}
 	if err := waitTextbox(c, 15*time.Second); err != nil {
+		return nil, err
+	}
+	refPaths, err := pasteReferences(c, opts.Refs, 60*time.Second)
+	if err != nil {
 		return nil, err
 	}
 	if err := injectPrompt(c, opts.Prompt); err != nil {
@@ -123,6 +130,7 @@ func Gen(c *browser.Client, opts Options) (*Result, error) {
 	absThumb, _ := filepath.Abs(thumbPath)
 	return &Result{
 		Prompt:     opts.Prompt,
+		Refs:       refPaths,
 		Full:       absFull,
 		Thumb:      absThumb,
 		Width:      w,
@@ -195,6 +203,148 @@ func clickSend(c *browser.Client) error {
 		return fmt.Errorf("click send failed: %s", out.Err)
 	}
 	return nil
+}
+
+func pasteReferences(c *browser.Client, refs []string, timeout time.Duration) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	absRefs := make([]string, 0, len(refs))
+	for i, ref := range refs {
+		refBytes, err := os.ReadFile(ref)
+		if err != nil {
+			return nil, fmt.Errorf("read ref %q: %w", ref, err)
+		}
+		mimeType := detectReferenceMIME(ref, refBytes)
+		if !strings.HasPrefix(mimeType, "image/") {
+			return nil, fmt.Errorf("ref %q is not an image (detected %s)", ref, mimeType)
+		}
+		absRef, err := filepath.Abs(ref)
+		if err != nil {
+			return nil, fmt.Errorf("resolve ref %q: %w", ref, err)
+		}
+		fileName := fmt.Sprintf("ref-%02d%s", i+1, strings.ToLower(filepath.Ext(absRef)))
+		if filepath.Ext(fileName) == "" {
+			fileName += mimeExtension(mimeType)
+		}
+		if err := pasteReference(c, fileName, mimeType, refBytes); err != nil {
+			return nil, err
+		}
+		if err := waitForReferenceReady(c, fileName, timeout); err != nil {
+			return nil, err
+		}
+		absRefs = append(absRefs, absRef)
+	}
+	return absRefs, nil
+}
+
+func pasteReference(c *browser.Client, fileName, mimeType string, refBytes []byte) error {
+	encodedName, _ := json.Marshal(fileName)
+	encodedMIME, _ := json.Marshal(mimeType)
+	encodedBase64, _ := json.Marshal(base64.StdEncoding.EncodeToString(refBytes))
+	code := fmt.Sprintf(`(function(){
+		const tb = document.querySelector('div[contenteditable="true"][role="textbox"]') || document.querySelector('[contenteditable="true"][role="textbox"]');
+		if (!tb) return { ok: false, err: 'textbox_not_found' };
+		const fileName = %s;
+		const mimeType = %s;
+		const b64 = %s;
+		const bin = atob(b64);
+		const bytes = new Uint8Array(bin.length);
+		for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+		const file = new File([bytes], fileName, { type: mimeType });
+		const dt = new DataTransfer();
+		dt.items.add(file);
+		tb.focus();
+		const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+		return { ok: true, handled: !tb.dispatchEvent(ev) };
+	})()`, string(encodedName), string(encodedMIME), string(encodedBase64))
+	var out struct {
+		OK      bool   `json:"ok"`
+		Handled bool   `json:"handled"`
+		Err     string `json:"err"`
+	}
+	if err := c.EvaluateValue(code, &out); err != nil {
+		return fmt.Errorf("paste ref %q: %w", fileName, err)
+	}
+	if !out.OK {
+		return fmt.Errorf("paste ref %q failed: %s", fileName, out.Err)
+	}
+	return nil
+}
+
+func waitForReferenceReady(c *browser.Client, fileName string, timeout time.Duration) error {
+	encodedName, _ := json.Marshal(fileName)
+	code := fmt.Sprintf(`(function(){
+		const bodyText = document.body && document.body.innerText ? document.body.innerText : '';
+		const loading = bodyText.includes('正在加载图片') || bodyText.includes('Uploading image') || bodyText.includes('Loading image');
+		const duplicate = bodyText.includes('你已上传过名为') && bodyText.includes(%s);
+		const sendSelectors = ['button.send-button','button[aria-label="发送"]','button[aria-label="Send"]'];
+		const sendReady = sendSelectors.some(sel => { const b = document.querySelector(sel); return b && !b.disabled; });
+		return { loading, duplicate, sendReady };
+	})()`, string(encodedName))
+	deadline := time.Now().Add(timeout)
+	stable := 0
+	for time.Now().Before(deadline) {
+		var out struct {
+			Loading   bool `json:"loading"`
+			Duplicate bool `json:"duplicate"`
+			SendReady bool `json:"sendReady"`
+		}
+		if err := c.EvaluateValue(code, &out); err != nil {
+			return fmt.Errorf("wait for ref %q: %w", fileName, err)
+		}
+		if out.Duplicate {
+			return fmt.Errorf("Gemini rejected duplicate ref name %q", fileName)
+		}
+		if !out.Loading && out.SendReady {
+			stable++
+			if stable >= 2 {
+				return nil
+			}
+		} else {
+			stable = 0
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for ref %q to finish loading", fileName)
+}
+
+func detectReferenceMIME(path string, refBytes []byte) string {
+	mimeType := http.DetectContentType(refBytes)
+	if strings.HasPrefix(mimeType, "image/") {
+		return mimeType
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".bmp":
+		return "image/bmp"
+	default:
+		return mimeType
+	}
+}
+
+func mimeExtension(mimeType string) string {
+	switch mimeType {
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/webp":
+		return ".webp"
+	case "image/gif":
+		return ".gif"
+	case "image/bmp":
+		return ".bmp"
+	default:
+		return ".img"
+	}
 }
 
 func waitForDisplayedImage(c *browser.Client, timeout time.Duration) error {
