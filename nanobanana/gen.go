@@ -2,11 +2,14 @@ package nanobanana
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"image"
+	_ "image/jpeg"
 	"image/png"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,9 +19,19 @@ import (
 	"nanobanana-cli/browser"
 
 	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp"
 )
 
 const geminiURL = "https://gemini.google.com/"
+
+// Watermark-removal assets and algorithm are adapted from MIT-licensed
+// gemini-watermark-remover / GeminiWatermarkTool projects. See THIRD_PARTY_NOTICES.md.
+//
+//go:embed watermark_assets/bg_48.png
+var watermarkBG48 []byte
+
+//go:embed watermark_assets/bg_96.png
+var watermarkBG96 []byte
 
 // Result is the JSON payload returned by `gen`.
 type Result struct {
@@ -34,11 +47,12 @@ type Result struct {
 
 // Options drive a single image generation.
 type Options struct {
-	Prompt     string
-	Refs       []string
-	OutDir     string
-	ThumbWidth int
-	Timeout    time.Duration
+	Prompt          string
+	Refs            []string
+	OutDir          string
+	ThumbWidth      int
+	Timeout         time.Duration
+	RemoveWatermark bool
 }
 
 // Gen orchestrates:
@@ -76,11 +90,11 @@ func Gen(c *browser.Client, opts Options) (*Result, error) {
 	if err := waitTextbox(c, 15*time.Second); err != nil {
 		return nil, err
 	}
-	refPaths, err := pasteReferences(c, opts.Refs, 60*time.Second)
-	if err != nil {
+	if err := injectPrompt(c, opts.Prompt); err != nil {
 		return nil, err
 	}
-	if err := injectPrompt(c, opts.Prompt); err != nil {
+	refPaths, err := pasteReferences(c, opts.Refs, 60*time.Second)
+	if err != nil {
 		return nil, err
 	}
 	if err := clickSend(c); err != nil {
@@ -110,9 +124,15 @@ func Gen(c *browser.Client, opts Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	w, h, err := pngDimensions(pngBytes)
+	if opts.RemoveWatermark {
+		pngBytes, err = removeNanoBananaWatermark(pngBytes)
+		if err != nil {
+			return nil, fmt.Errorf("remove watermark: %w", err)
+		}
+	}
+	w, h, err := imageDimensions(pngBytes)
 	if err != nil {
-		return nil, fmt.Errorf("parse downloaded PNG: %w", err)
+		return nil, fmt.Errorf("parse downloaded image: %w", err)
 	}
 
 	stem := time.Now().Format("20060102-150405")
@@ -230,7 +250,7 @@ func pasteReferences(c *browser.Client, refs []string, timeout time.Duration) ([
 		if err := pasteReference(c, fileName, mimeType, refBytes); err != nil {
 			return nil, err
 		}
-		if err := waitForReferenceReady(c, fileName, timeout); err != nil {
+		if err := waitForReferenceReady(c, fileName, i+1, timeout); err != nil {
 			return nil, err
 		}
 		absRefs = append(absRefs, absRef)
@@ -272,7 +292,7 @@ func pasteReference(c *browser.Client, fileName, mimeType string, refBytes []byt
 	return nil
 }
 
-func waitForReferenceReady(c *browser.Client, fileName string, timeout time.Duration) error {
+func waitForReferenceReady(c *browser.Client, fileName string, expectedCount int, timeout time.Duration) error {
 	encodedName, _ := json.Marshal(fileName)
 	code := fmt.Sprintf(`(function(){
 		const bodyText = document.body && document.body.innerText ? document.body.innerText : '';
@@ -280,15 +300,24 @@ func waitForReferenceReady(c *browser.Client, fileName string, timeout time.Dura
 		const duplicate = bodyText.includes('你已上传过名为') && bodyText.includes(%s);
 		const sendSelectors = ['button.send-button','button[aria-label="发送"]','button[aria-label="Send"]'];
 		const sendReady = sendSelectors.some(sel => { const b = document.querySelector(sel); return b && !b.disabled; });
-		return { loading, duplicate, sendReady };
+		const inputField = document.querySelector('.text-input-field.with-file-preview') || document.querySelector('.text-input-field');
+		const attachmentRoot = inputField ? (inputField.querySelector('.attachment-preview-wrapper') || inputField.querySelector('.uploader-file-preview-container') || inputField) : null;
+		const previewChips = attachmentRoot ? attachmentRoot.querySelectorAll('uploader-file-preview, .file-preview-chip, .file-preview-container') : [];
+		const loadedPreviewImages = attachmentRoot ? [...attachmentRoot.querySelectorAll('img[data-test-id="image-preview"], img[data-test-id="uploaded-img"], img.preview-image')].filter(img => img.complete && img.naturalWidth > 0) : [];
+		const removeButtons = attachmentRoot ? attachmentRoot.querySelectorAll('[data-test-id="cancel-button"], button.cancel-button[aria-label*="移除文件"], button.cancel-button[aria-label*="Remove file"]') : [];
+		const attachmentCount = Math.min(loadedPreviewImages.length, Math.max(previewChips.length, removeButtons.length, loadedPreviewImages.length));
+		return { loading, duplicate, sendReady, attachmentCount, chipCount: previewChips.length, loadedImageCount: loadedPreviewImages.length };
 	})()`, string(encodedName))
 	deadline := time.Now().Add(timeout)
 	stable := 0
 	for time.Now().Before(deadline) {
 		var out struct {
-			Loading   bool `json:"loading"`
-			Duplicate bool `json:"duplicate"`
-			SendReady bool `json:"sendReady"`
+			Loading          bool `json:"loading"`
+			Duplicate        bool `json:"duplicate"`
+			SendReady        bool `json:"sendReady"`
+			AttachmentCount  int  `json:"attachmentCount"`
+			ChipCount        int  `json:"chipCount"`
+			LoadedImageCount int  `json:"loadedImageCount"`
 		}
 		if err := c.EvaluateValue(code, &out); err != nil {
 			return fmt.Errorf("wait for ref %q: %w", fileName, err)
@@ -296,9 +325,10 @@ func waitForReferenceReady(c *browser.Client, fileName string, timeout time.Dura
 		if out.Duplicate {
 			return fmt.Errorf("Gemini rejected duplicate ref name %q", fileName)
 		}
-		if !out.Loading && out.SendReady {
+		if !out.Loading && out.SendReady && out.ChipCount >= expectedCount && out.LoadedImageCount >= expectedCount && out.AttachmentCount >= expectedCount {
 			stable++
-			if stable >= 2 {
+			if stable >= 3 {
+				time.Sleep(1200 * time.Millisecond)
 				return nil
 			}
 		} else {
@@ -350,13 +380,31 @@ func mimeExtension(mimeType string) string {
 func waitForDisplayedImage(c *browser.Client, timeout time.Duration) error {
 	const code = `(function(){
 		const img = document.querySelector('generated-image img, .generated-image img, single-image img');
-		if (!img || !img.complete || img.naturalWidth === 0) return { ready: false };
-		return { ready: true };
+		const ready = !!(img && img.complete && img.naturalWidth > 0);
+		const bodyText = document.body && document.body.innerText ? document.body.innerText : '';
+		const lower = bodyText.toLowerCase();
+		const rateLimited = [
+			'too many requests',
+			'rate limit',
+			'limit reached',
+			"you've reached your limit",
+			'try again later',
+			'please wait',
+			'请求过于频繁',
+			'请求太频繁',
+			'操作过于频繁',
+			'稍后再试',
+			'请稍后',
+			'达到上限'
+		].some(s => lower.includes(s.toLowerCase()));
+		return { ready, rateLimited };
 	})()`
 	deadline := time.Now().Add(timeout)
+	rateLimitedStable := 0
 	for time.Now().Before(deadline) {
 		var out struct {
-			Ready bool `json:"ready"`
+			Ready       bool `json:"ready"`
+			RateLimited bool `json:"rateLimited"`
 		}
 		if err := c.EvaluateValue(code, &out); err != nil {
 			return fmt.Errorf("poll image: %w", err)
@@ -364,9 +412,67 @@ func waitForDisplayedImage(c *browser.Client, timeout time.Duration) error {
 		if out.Ready {
 			return nil
 		}
+		if out.RateLimited {
+			rateLimitedStable++
+			if rateLimitedStable >= 3 {
+				return fmt.Errorf("Gemini indicates requests are too frequent; wait a while and retry")
+			}
+		} else {
+			rateLimitedStable = 0
+		}
 		time.Sleep(1 * time.Second)
 	}
-	return fmt.Errorf("timeout waiting for generated image (did Gemini route this prompt to image generation?)")
+	if reason, err := classifyNoImageResponse(c); err == nil && reason != "" {
+		return fmt.Errorf("%s", reason)
+	}
+	return fmt.Errorf("timeout waiting for generated image; strengthen the prompt so Gemini clearly generates an image")
+}
+
+func classifyNoImageResponse(c *browser.Client) (string, error) {
+	const code = `(function(){
+		const textOf = el => (el && el.innerText ? el.innerText.trim() : '');
+		const bodyText = textOf(document.body);
+		const lower = bodyText.toLowerCase();
+		const rateLimited = [
+			'too many requests',
+			'rate limit',
+			'limit reached',
+			"you've reached your limit",
+			'try again later',
+			'please wait',
+			'请求过于频繁',
+			'请求太频繁',
+			'操作过于频繁',
+			'稍后再试',
+			'请稍后',
+			'达到上限'
+		].some(s => lower.includes(s.toLowerCase()));
+		const selectors = [
+			'message-content',
+			'model-response',
+			'.model-response-text',
+			'.response-container',
+			'.markdown'
+		];
+		const candidates = selectors.flatMap(sel => [...document.querySelectorAll(sel)])
+			.map(textOf)
+			.filter(t => t.length >= 20);
+		return { rateLimited, hasTextResponse: candidates.length > 0 };
+	})()`
+	var out struct {
+		RateLimited     bool `json:"rateLimited"`
+		HasTextResponse bool `json:"hasTextResponse"`
+	}
+	if err := c.EvaluateValue(code, &out); err != nil {
+		return "", err
+	}
+	if out.RateLimited {
+		return "Gemini indicates requests are too frequent; wait a while and retry", nil
+	}
+	if out.HasTextResponse {
+		return "Gemini returned text instead of an image; strengthen the prompt with an explicit image-generation instruction", nil
+	}
+	return "", nil
 }
 
 func clickDownload(c *browser.Client) error {
@@ -493,10 +599,9 @@ func fetchInterceptedImage(c *browser.Client, timeout time.Duration) ([]byte, er
 	return nil, fmt.Errorf("timeout waiting for download-chain URL (did Gemini change its download flow?)")
 }
 
-// pngDimensions reads width/height from a PNG IHDR chunk without fully
-// decoding pixel data — cheap even for multi-MB images.
-func pngDimensions(b []byte) (int, int, error) {
-	cfg, err := png.DecodeConfig(bytes.NewReader(b))
+// imageDimensions reads width/height without fully decoding pixel data.
+func imageDimensions(b []byte) (int, int, error) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(b))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -505,10 +610,115 @@ func pngDimensions(b []byte) (int, int, error) {
 
 // --- local image handling ---
 
-func writeThumbnail(pngBytes []byte, path string, width int) error {
-	src, err := png.Decode(bytes.NewReader(pngBytes))
+type watermarkConfig struct {
+	logoSize     int
+	marginRight  int
+	marginBottom int
+}
+
+func removeNanoBananaWatermark(imageBytes []byte) ([]byte, error) {
+	src, _, err := image.Decode(bytes.NewReader(imageBytes))
 	if err != nil {
-		return fmt.Errorf("decode png: %w", err)
+		return nil, fmt.Errorf("decode image: %w", err)
+	}
+	sb := src.Bounds()
+	width, height := sb.Dx(), sb.Dy()
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("source image has invalid dimensions")
+	}
+
+	cfg := detectWatermarkConfig(width, height)
+	if width < cfg.logoSize+cfg.marginRight || height < cfg.logoSize+cfg.marginBottom {
+		return encodePNG(src)
+	}
+
+	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			dst.Set(x, y, src.At(sb.Min.X+x, sb.Min.Y+y))
+		}
+	}
+
+	alphaMap, err := watermarkAlphaMap(cfg.logoSize)
+	if err != nil {
+		return nil, err
+	}
+	removeWatermarkPixels(dst, alphaMap, cfg)
+	return encodePNG(dst)
+}
+
+func detectWatermarkConfig(width, height int) watermarkConfig {
+	if width > 1024 && height > 1024 {
+		return watermarkConfig{logoSize: 96, marginRight: 64, marginBottom: 64}
+	}
+	return watermarkConfig{logoSize: 48, marginRight: 32, marginBottom: 32}
+}
+
+func watermarkAlphaMap(size int) ([]float64, error) {
+	var bgBytes []byte
+	switch size {
+	case 48:
+		bgBytes = watermarkBG48
+	case 96:
+		bgBytes = watermarkBG96
+	default:
+		return nil, fmt.Errorf("unsupported watermark size: %d", size)
+	}
+	bg, _, err := image.Decode(bytes.NewReader(bgBytes))
+	if err != nil {
+		return nil, fmt.Errorf("decode watermark background: %w", err)
+	}
+	alphaMap := make([]float64, size*size)
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			r, g, b, _ := bg.At(bg.Bounds().Min.X+x, bg.Bounds().Min.Y+y).RGBA()
+			maxChannel := max(max(int(r>>8), int(g>>8)), int(b>>8))
+			alphaMap[y*size+x] = float64(maxChannel) / 255.0
+		}
+	}
+	return alphaMap, nil
+}
+
+func removeWatermarkPixels(img *image.NRGBA, alphaMap []float64, cfg watermarkConfig) {
+	const (
+		alphaThreshold = 0.002
+		maxAlpha       = 0.99
+		logoValue      = 255.0
+	)
+	x0 := img.Bounds().Dx() - cfg.marginRight - cfg.logoSize
+	y0 := img.Bounds().Dy() - cfg.marginBottom - cfg.logoSize
+	for row := 0; row < cfg.logoSize; row++ {
+		for col := 0; col < cfg.logoSize; col++ {
+			alpha := alphaMap[row*cfg.logoSize+col]
+			if alpha < alphaThreshold {
+				continue
+			}
+			if alpha > maxAlpha {
+				alpha = maxAlpha
+			}
+			pixOffset := img.PixOffset(x0+col, y0+row)
+			oneMinusAlpha := 1.0 - alpha
+			for channel := 0; channel < 3; channel++ {
+				watermarked := float64(img.Pix[pixOffset+channel])
+				original := (watermarked - alpha*logoValue) / oneMinusAlpha
+				img.Pix[pixOffset+channel] = uint8(math.Max(0, math.Min(255, math.Round(original))))
+			}
+		}
+	}
+}
+
+func encodePNG(src image.Image) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, src); err != nil {
+		return nil, fmt.Errorf("encode png: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func writeThumbnail(imageBytes []byte, path string, width int) error {
+	src, _, err := image.Decode(bytes.NewReader(imageBytes))
+	if err != nil {
+		return fmt.Errorf("decode image: %w", err)
 	}
 	sb := src.Bounds()
 	if sb.Dx() == 0 {

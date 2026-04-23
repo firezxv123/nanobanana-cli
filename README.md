@@ -1,6 +1,6 @@
 # nanobanana-cli
 
-Generate images via Google Gemini's **Nano Banana** (Gemini 2.5 Flash Image) model from the command line and save a full-size PNG plus a locally-scaled thumbnail.
+Generate images via Google Gemini's **Nano Banana** (Gemini 2.5 Flash Image) model from the command line and save a full-size PNG plus a locally-scaled thumbnail. Local watermark removal is enabled by default.
 
 The CLI drives your **real Chrome session** through [`kimi-webbridge`](https://www.kimi.com/features/webbridge), so it reuses your existing Gemini login — no API key, no OAuth setup, no separate Gemini for Developers quota.
 
@@ -28,7 +28,7 @@ nanobanana-cli gen "参考这两张图做一个更现代的版本" -r ./ref1.png
 
 Each run saves two files into `-o <dir>`:
 
-- `<timestamp>-full.png` — the **real** high-resolution original (currently 2816×1536 for Nano Banana; ~5–7 MB), intercepted from Gemini's "Download full-size" response chain
+- `<timestamp>-full.png` — the **real** high-resolution image, intercepted from Gemini's "Download full-size" response chain and de-watermarked locally by default
 - `<timestamp>-thumb.png` — PNG scaled to `--thumb-width` px (aspect preserved, default 256)
 
 ## Requirements
@@ -71,6 +71,7 @@ Flags:
   -r, --ref stringArray   reference image path to paste into Gemini before sending the prompt (repeatable)
       --thumb-width int   thumbnail width in px (default 256)
       --timeout int       max seconds to wait for image generation (default 300)
+      --remove-watermark  remove Nano Banana watermark locally before saving (default true)
 ```
 
 Output is **always JSON** on stdout. Non-zero exit code on error. Error shape:
@@ -99,7 +100,7 @@ POST :10086/command  ─────▶  Chrome extension  ─────▶  g
     │                                                         │
     │ ◀─── base64 PNG (2816×1536, ~5–7 MB)  ◀──────────────────┘
     ▼
-Go: decode PNG → write *-full.png → resize (Catmull-Rom) → write *-thumb.png
+Go: optional local watermark removal → write *-full.png → resize (Catmull-Rom) → write *-thumb.png
 ```
 
 **The `<img>` in the chat is NOT the original.** Gemini renders a 1024×559 display-sized copy inline — fine for viewing, useless for saving. The real original only becomes accessible when you click "Download full-size", which kicks off a 4-hop URL chain:
@@ -112,6 +113,8 @@ GET  lh3.../rd-gg-dl/...                    → image/png  (Chrome downloads)   
 ```
 
 Letting step 4 complete normally pops up Chrome's "Save As" dialog — nasty for a CLI. Instead, the CLI installs a `window.fetch` hook before clicking download: when step 3 fires, the hook captures the final URL out of the response body into a window variable, then returns an empty `Response` so Gemini's own code has no URL to navigate to. Chrome never sees a Content-Disposition load, no dialog. The CLI then runs its own `fetch(window.__nbFinalURL)` from evaluate — `fetch()` is JS-initiated, stays in the renderer, no download manager. We base64-encode the bytes and ship them back to Go.
+
+Watermark removal is local and uses embedded Nano Banana watermark alpha maps. Pass `--remove-watermark=false` if you need Gemini's original downloaded bytes.
 
 **Why generate the thumbnail locally instead of asking Gemini?** There is no separate thumbnail resource — the chat UI just CSS-scales the 1024×559 display copy. Scaling from the original via `golang.org/x/image/draw.CatmullRom` is deterministic, offline, and `--thumb-width` lets the caller pick any size.
 
@@ -132,7 +135,9 @@ nanobanana-cli/
 |---------|--------------|
 | `daemon_unreachable` | Kimi Desktop App not running. Open it. |
 | `extension_not_connected` | Chrome WebBridge extension not installed/enabled. See <https://www.kimi.com/features/webbridge>. |
-| `timeout waiting for generated image` | Gemini routed your prompt to text response, not image. Rephrase to be clearly an image-gen request (e.g., start with `画` / `generate an image of`). |
+| `Gemini returned text instead of an image` | Gemini answered in text mode. Strengthen the prompt with an explicit image-generation instruction. |
+| `Gemini indicates requests are too frequent` | Gemini is temporarily rate-limiting or asking you to wait. Retry later. |
+| `timeout waiting for generated image` | No generated image was detected before timeout. Rephrase to be clearly an image-gen request. |
 | `prompt is empty` | `gen ""` — pass a non-empty prompt. |
 
 ## License

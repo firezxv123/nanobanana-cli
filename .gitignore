@@ -14,8 +14,12 @@
 
 # Generated outputs
 /tmp/
+/temp/
+/out/
 *.png
 !docs/**/*.png
+!nanobanana/watermark_assets/
+!nanobanana/watermark_assets/*.png
 
 # IDE
 .idea/
